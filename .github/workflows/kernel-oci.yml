@@ -34,21 +34,8 @@ jobs:
   build-publish:
     runs-on: ubuntu-24.04-arm   # native aarch64 → no emulation
     steps:
-      # Lay the checkouts out so the Taskfile's relative
-      # ../../cloud-boot/kernel (from the repo root) resolves to the
-      # cloud-boot/kernel checkout below.
       - name: Check out weft-microvm-kernel
         uses: actions/checkout@v4
-        with:
-          path: openweft/weft-microvm-kernel
-
-      # The kernel Taskfile stages cloud-arm64.config + the cmdline patch
-      # from ../../cloud-boot/kernel.
-      - name: Check out cloud-boot/kernel (cloud-arm64 baseline)
-        uses: actions/checkout@v4
-        with:
-          repository: cloud-boot/kernel
-          path: cloud-boot/kernel
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -60,7 +47,6 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build the microVM kernel (CONFIG_WIREGUARD + FUSE/VIRTIO_FS)
-        working-directory: openweft/weft-microvm-kernel
         run: |
           set -euo pipefail
           # task arm64-microvm installs to $XDG_DATA_HOME/weft-microvm/kernel.

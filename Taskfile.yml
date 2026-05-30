@@ -17,7 +17,6 @@
 version: '3'
 
 vars:
-  CLOUD_BOOT_KERNEL: '{{.TASKFILE_DIR}}/../../cloud-boot/kernel'
   IMAGE_TAG:        'weft-microvm-kernel-arm64:7.0.8'
   OUT_DIR:          '{{.XDG_DATA_HOME | default (printf "%s/.local/share" .HOME)}}/weft-microvm'
   STAGED_CONTEXT:   '{{.TASKFILE_DIR}}/.build-ctx'
@@ -44,18 +43,18 @@ tasks:
       - mv "{{.OUT_DIR}}/Image" "{{.OUT_DIR}}/kernel"
       - ls -lh "{{.OUT_DIR}}/kernel"
 
-  # Stage the build context: the Dockerfile + microvm fragment from
-  # this dir, plus cloud-arm64.config and the CMDLINE_EXTEND patch
-  # from cloud-boot/kernel. Keeps the cloud-arm64 baseline a single
-  # symlink-able source of truth rather than vendoring a copy.
+  # Stage the build context: the Dockerfile + microvm fragment + the
+  # cloud-arm64 baseline config + the CMDLINE_EXTEND patch — all sources
+  # live in this repo (vendored from the legacy cloud-boot/kernel sibling
+  # to make weft-microvm-* self-contained).
   stage-context:
     cmds:
       - rm -rf "{{.STAGED_CONTEXT}}"
       - mkdir -p "{{.STAGED_CONTEXT}}/patches"
       - cp "{{.TASKFILE_DIR}}/Dockerfile.arm64-microvm" "{{.STAGED_CONTEXT}}/"
       - cp "{{.TASKFILE_DIR}}/microvm.config-fragment"  "{{.STAGED_CONTEXT}}/"
-      - cp "{{.CLOUD_BOOT_KERNEL}}/cloud-arm64.config"  "{{.STAGED_CONTEXT}}/"
-      - cp "{{.CLOUD_BOOT_KERNEL}}/patches/arm64-cmdline-extend.patch" "{{.STAGED_CONTEXT}}/patches/"
+      - cp "{{.TASKFILE_DIR}}/cloud-arm64.config"       "{{.STAGED_CONTEXT}}/"
+      - cp "{{.TASKFILE_DIR}}/patches/arm64-cmdline-extend.patch" "{{.STAGED_CONTEXT}}/patches/"
 
   clean:
     desc: Remove the staged build context and the installed kernel.
@@ -84,8 +83,8 @@ tasks:
       # base64-injects them into cloud-init's user-data, so any
       # fragment edit here is automatically applied to the next build.
       - cp "{{.TASKFILE_DIR}}/microvm.config-fragment"                                      "{{.KBUILD_DIR}}/share/microvm.config-fragment"
-      - cp "{{.CLOUD_BOOT_KERNEL}}/cloud-arm64.config"                                       "{{.KBUILD_DIR}}/share/cloud-arm64.config"
-      - cp "{{.CLOUD_BOOT_KERNEL}}/patches/arm64-cmdline-extend.patch"                       "{{.KBUILD_DIR}}/share/arm64-cmdline-extend.patch"
+      - cp "{{.TASKFILE_DIR}}/cloud-arm64.config"                                            "{{.KBUILD_DIR}}/share/cloud-arm64.config"
+      - cp "{{.TASKFILE_DIR}}/patches/arm64-cmdline-extend.patch"                            "{{.KBUILD_DIR}}/share/arm64-cmdline-extend.patch"
       # Fresh instance-id (epoch seconds) forces cloud-init to re-run
       # runcmd → build.sh on the next boot, even though the qcow2 is
       # reused across runs.
