@@ -1,0 +1,151 @@
+# microvm.config-fragment — kconfig fragment to overlay on a base
+# kernel config (typically cloud-boot's cloud-<arch>.config) to
+# enable the bits ncl-init needs at runtime AND disable the rest
+# of the kernel-boot fat we don't need for a headless OCI microVM.
+#
+# Usage with merge_config.sh:
+#
+#   ./scripts/kconfig/merge_config.sh \
+#       cloud-boot/kernel/cloud-arm64.config \
+#       openweft/weft-microvm-kernel/microvm.config-fragment
+#
+# Or just `cat` it onto the end of the .config before `make olddefconfig`.
+
+# ---- Enable: what ncl-init actually uses ----
+
+# FUSE_FS is the userspace-filesystem backbone; VIRTIO_FS is the
+# virtio transport the Apple-VZ backend exposes as the rootfs share
+# carrying the OCI image extracted by `weft microvm run`. weft-init
+# mounts the share as the new rootfs before pivot_root.
+CONFIG_FUSE_FS=y
+CONFIG_VIRTIO_FS=y
+
+# virtio-9p: alternate rootfs transport used by the QEMU backend on
+# a macOS host, where virtio-fs is not viable because virtiofsd (the
+# vhost-user backend QEMU virtio-fs depends on) is Linux-only. QEMU
+# has a built-in 9p server inside the qemu-system process — no extra
+# daemon — so weft-driver-qemu wires `-fsdev local + virtio-9p-pci`
+# and weft-init mounts the share with type "9p", option
+# "trans=virtio,version=9p2000.L". Apple-VZ stays on virtio-fs.
+# Profiled cost ≈ 5 ms at kernel-boot stage (see disable comment
+# below) — accepted tradeoff for QEMU/macOS dev parity.
+CONFIG_NET_9P=y
+CONFIG_NET_9P_VIRTIO=y
+CONFIG_9P_FS=y
+
+# WireGuard: the in-kernel encrypted overlay weft-init brings up as
+# wg0 (rtnetlink RTM_NEWLINK kind "wireguard" + genetlink
+# WG_CMD_SET_DEVICE — see weft-vm-init/pkg/network). Carries inter-VM
+# mesh links and the operator's `weft instance ps` channel. Built-in
+# (=y) so the genl "wireguard" family is present at boot; it pulls its
+# own crypto deps via Kconfig `select`. WireGuard is its own netdev
+# type and does NOT need TUN (kept disabled below).
+CONFIG_WIREGUARD=y
+
+# Optional but recommended: overlayfs lets ncl run multiple
+# microVMs off the same read-only base rootfs with cheap
+# copy-on-write upper layers. Not required for the boot to
+# succeed; can be enabled later when the runner grows the
+# overlay-mode flag.
+# CONFIG_OVERLAY_FS=y
+
+# ---- Container primitives ----
+# cloud-boot's cloud-<arch>.config base is minimised for plain VM
+# workloads and explicitly strips CGROUPS / NAMESPACES — fine for a
+# vanilla cloud image, fatal for a microVM that runs an OCI runtime
+# (crun) under weft-init. Re-enable the bare-minimum set so crun's
+# `statfs /sys/fs/cgroup` succeeds and container namespaces work.
+# Sub-controller selection mirrors what crun/runc check at startup;
+# trimming any of these makes specific OCI features (cpu shares,
+# device cgroup, memory limits, …) fail at create time.
+CONFIG_CGROUPS=y
+CONFIG_MEMCG=y
+CONFIG_BLK_CGROUP=y
+CONFIG_CGROUP_SCHED=y
+CONFIG_CGROUP_PIDS=y
+CONFIG_CGROUP_FREEZER=y
+CONFIG_CGROUP_DEVICE=y
+CONFIG_CGROUP_CPUACCT=y
+CONFIG_CGROUP_BPF=y
+CONFIG_NAMESPACES=y
+CONFIG_PID_NS=y
+CONFIG_NET_NS=y
+CONFIG_USER_NS=y
+CONFIG_UTS_NS=y
+CONFIG_IPC_NS=y
+
+# ---- Disable: every device class cloud-arm64 ships that a
+# headless microVM never touches. Each kept driver costs us boot
+# time: the kernel probes / registers / inits it serially before
+# Run /init as init process. Profiled cost on Apple Silicon
+# (from console.log of the 0.0–0.18 s window): drm/virtio-gpu
+# ~30 ms, usb-net stack ~20 ms, fb/console ~15 ms, 9p ~5 ms,
+# bridge/8021q/sit ~5 ms, tun/loop ~5 ms = ~80 ms saved at the
+# kernel-boot stage. ----
+
+# DRM + framebuffer console: a microVM has no display. The cloud-
+# arm64 baseline keeps these for the VZ graphical window flow;
+# ncl runs headless via virtio-console only.
+# CONFIG_DRM is not set
+# CONFIG_DRM_VIRTIO_GPU is not set
+# CONFIG_FB is not set
+# CONFIG_FRAMEBUFFER_CONSOLE is not set
+# CONFIG_VT is not set
+# CONFIG_VT_CONSOLE is not set
+
+# USB everything. The microVM exposes no USB. cloud-arm64 keeps
+# USB-net + HID drivers for the vfkit GUI keyboard/mouse story.
+# CONFIG_USB_SUPPORT is not set
+# CONFIG_USB is not set
+# CONFIG_USB_NET_DRIVERS is not set
+# CONFIG_USB_PEGASUS is not set
+# CONFIG_USB_RTL8150 is not set
+# CONFIG_USB_RTL8152 is not set
+# CONFIG_USB_LAN78XX is not set
+# CONFIG_USB_USBNET is not set
+# CONFIG_USB_NET_AX8817X is not set
+# CONFIG_USB_NET_AX88179_178A is not set
+# CONFIG_USB_NET_CDCETHER is not set
+# CONFIG_USB_NET_CDC_NCM is not set
+# CONFIG_USB_NET_DM9601 is not set
+# CONFIG_USB_NET_MCS7830 is not set
+# CONFIG_USB_NET_SMSC75XX is not set
+# CONFIG_USB_NET_SMSC95XX is not set
+# CONFIG_USB_NET_NET1080 is not set
+# CONFIG_USB_NET_PLUSB is not set
+# CONFIG_USB_NET_CDC_SUBSET is not set
+# CONFIG_USB_ALI_M5632 is not set
+# CONFIG_USB_AN2720 is not set
+# CONFIG_USB_BELKIN is not set
+# CONFIG_USB_ARMLINUX is not set
+# CONFIG_USB_EPSON2888 is not set
+# CONFIG_USB_KC2190 is not set
+# CONFIG_USB_NET_ZAURUS is not set
+# CONFIG_USB_HSO is not set
+# CONFIG_USB_NET_INT51X1 is not set
+# CONFIG_USB_IPHETH is not set
+# CONFIG_USB_SIERRA_NET is not set
+# CONFIG_USB_VL600 is not set
+# CONFIG_USB_NET_CH9200 is not set
+# CONFIG_USB_NET_AQC111 is not set
+
+# Network features we never use inside the microVM. virtio-net
+# in NAT mode is enough; no bridging, no VLANs, no IPv6 tunnels,
+# no TUN/TAP (the container does its own networking if it needs
+# any).
+# CONFIG_BRIDGE is not set
+# CONFIG_BRIDGE_NETFILTER is not set
+# CONFIG_VLAN_8021Q is not set
+# 9p re-enabled above (CONFIG_NET_9P / CONFIG_9P_FS / CONFIG_NET_9P_VIRTIO)
+# for QEMU-backend rootfs sharing; the ~5 ms boot cost noted in the
+# header comment is the tradeoff for QEMU/macOS dev parity.
+# CONFIG_IPV6_SIT is not set
+# CONFIG_IPV6_TUNNEL is not set
+# CONFIG_TUN is not set
+
+# Block layer fat: loopback + nbd + drbd + every legacy bus.
+# A microVM only reads from virtio-fs; the kernel needs no
+# loopback to map files inside.
+# CONFIG_BLK_DEV_LOOP is not set
+# CONFIG_BLK_DEV_NBD is not set
+# CONFIG_BLK_DEV_DRBD is not set

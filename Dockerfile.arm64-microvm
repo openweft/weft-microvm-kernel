@@ -1,0 +1,77 @@
+# Builds the aarch64 Linux kernel for weft microVMs.
+#
+# Same recipe as cloud-boot/kernel/Dockerfile.arm64 (minimal cloud
+# guest, EFI_STUB, PL011 serial, virtio everything) with one extra
+# overlay: microvm.config-fragment, which enables CONFIG_FUSE_FS and
+# CONFIG_VIRTIO_FS — needed by ncl-init so it can mount the OCI
+# image rootfs the host shares via virtio-fs.
+#
+# Output: /Image is the raw aarch64 boot image (NOT the EFI-stub'd
+# vmlinuz.efi cloud-boot produces). vz.LinuxBootLoader in
+# Code-Hex/vz wants the raw kernel; it acts as the EFI stub itself
+# and jumps straight into the kernel — no firmware in the picture.
+#
+# Build expects two artefacts in its context (the task wrapper
+# copies them in before `docker build`):
+#   - cloud-arm64.config              (from cloud-boot/kernel)
+#   - microvm.config-fragment         (this directory)
+#   - patches/arm64-cmdline-extend.patch (from cloud-boot/kernel)
+
+FROM debian:bookworm-slim AS build
+
+ARG LINUX_VERSION=7.0.8
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libssl-dev \
+    libelf-dev \
+    bc \
+    flex \
+    bison \
+    cpio \
+    wget \
+    xz-utils \
+    bsdmainutils \
+    ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+RUN wget -q "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-${LINUX_VERSION}.tar.xz" \
+ && tar -xf "linux-${LINUX_VERSION}.tar.xz" \
+ && rm "linux-${LINUX_VERSION}.tar.xz"
+
+WORKDIR /build/linux-${LINUX_VERSION}
+
+# Copy both overlays into the build context. cloud-arm64.config goes
+# first (it strips the vendor zoo down to virtio-only), then the
+# microvm fragment layers FUSE_FS + VIRTIO_FS on top.
+COPY cloud-arm64.config           /build/cloud-arm64.config
+COPY microvm.config-fragment      /build/microvm.config-fragment
+
+# CMDLINE_EXTEND patch (same rationale as cloud-boot/kernel — see
+# its Dockerfile header for the upstream link).
+COPY patches/arm64-cmdline-extend.patch /build/arm64-cmdline-extend.patch
+RUN patch -p1 < /build/arm64-cmdline-extend.patch
+
+# defconfig → cloud-arm64 overlay → microvm overlay → resolve deps.
+# The two-step overlay keeps the cloud-arm64 baseline frozen so we
+# can re-sync from cloud-boot/kernel by replacing one file.
+RUN make ARCH=arm64 defconfig \
+ && cat /build/cloud-arm64.config >> .config \
+ && cat /build/microvm.config-fragment >> .config \
+ && make ARCH=arm64 olddefconfig
+
+# Produce the raw Image (no EFI stub, no ZBOOT compression — vz's
+# LinuxBootLoader doesn't need either, it takes the bare arm64 boot
+# image and jumps into it). About 7-10 MiB depending on the
+# fragment overlay's footprint.
+RUN make ARCH=arm64 -j"$(nproc)" Image \
+ && cp arch/arm64/boot/Image /Image \
+ && ls -lh /Image
+
+# A `--target export` stage so the Taskfile recipe can `docker
+# build --output=type=local,dest=…` and extract /Image without
+# spinning up a container.
+FROM scratch AS export
+COPY --from=build /Image /Image

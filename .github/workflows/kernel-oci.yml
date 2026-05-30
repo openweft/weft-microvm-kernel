@@ -1,0 +1,105 @@
+name: Kernel → OCI
+
+# Builds the aarch64 microVM kernel (cloud-arm64 baseline + microvm
+# fragment, which enables FUSE_FS / VIRTIO_FS / WIREGUARD) and publishes
+# the resulting Image as an OCI artifact to GHCR, so weft can pull it the
+# same way it pulls any other image (oras → imagestore → boot).
+#
+# Runs on a NATIVE arm64 runner: the kernel compiles at native speed with
+# no QEMU emulation and no nested virtualization — the constraint that
+# rules out building it inside the macOS dev VM. CI is the canonical
+# producer; local QEMU/TCG builds stay a fallback for offline hacking.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "OCI tag (default: arm64-<short-sha>)"
+        required: false
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write   # push to ghcr.io
+
+env:
+  # artifactType + layer mediaType identify this as a weft microVM kernel,
+  # not a runnable container image — consumers select on these.
+  ARTIFACT_TYPE: application/vnd.openweft.microvm.kernel
+  IMAGE_MEDIATYPE: application/vnd.openweft.microvm.kernel.image
+  CONFIG_MEDIATYPE: application/vnd.openweft.microvm.kernel.config
+
+jobs:
+  build-publish:
+    runs-on: ubuntu-24.04-arm   # native aarch64 → no emulation
+    steps:
+      # Lay the checkouts out so the Taskfile's relative
+      # ../../cloud-boot/kernel (from the repo root) resolves to the
+      # cloud-boot/kernel checkout below.
+      - name: Check out weft-microvm-kernel
+        uses: actions/checkout@v4
+        with:
+          path: openweft/weft-microvm-kernel
+
+      # The kernel Taskfile stages cloud-arm64.config + the cmdline patch
+      # from ../../cloud-boot/kernel.
+      - name: Check out cloud-boot/kernel (cloud-arm64 baseline)
+        uses: actions/checkout@v4
+        with:
+          repository: cloud-boot/kernel
+          path: cloud-boot/kernel
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install Task
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the microVM kernel (CONFIG_WIREGUARD + FUSE/VIRTIO_FS)
+        working-directory: openweft/weft-microvm-kernel
+        run: |
+          set -euo pipefail
+          # task arm64-microvm installs to $XDG_DATA_HOME/weft-microvm/kernel.
+          export XDG_DATA_HOME="$PWD/out"
+          task arm64-microvm
+          install -D out/weft-microvm/kernel "$GITHUB_WORKSPACE/stage/Image"
+          # Carry the exact config that produced this Image for provenance.
+          cp .build-ctx/microvm.config-fragment "$GITHUB_WORKSPACE/stage/microvm.config-fragment"
+          # Confirm WireGuard actually landed in the merged .config if the
+          # build emitted one (defence against a silently-dropped option).
+          if [ -f .build-ctx/.config ]; then
+            grep -q '^CONFIG_WIREGUARD=y' .build-ctx/.config \
+              || { echo "::error::CONFIG_WIREGUARD missing from built .config"; exit 1; }
+          fi
+          ls -lh "$GITHUB_WORKSPACE/stage/"
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@v1
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push kernel as an OCI artifact
+        working-directory: stage
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/${{ github.repository_owner }}/weft-microvm-kernel"
+          tag="${{ inputs.tag }}"
+          [ -n "$tag" ] || tag="arm64-${GITHUB_SHA::12}"
+          oras push "${repo}:${tag}" \
+            --artifact-type "${ARTIFACT_TYPE}" \
+            --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --annotation "dev.openweft.kernel.arch=arm64" \
+            "Image:${IMAGE_MEDIATYPE}" \
+            "microvm.config-fragment:${CONFIG_MEDIATYPE}"
+          # Also move the floating arch tag so `:arm64` always resolves to
+          # the newest build (weft pins the digest; humans use the tag).
+          oras tag "${repo}:${tag}" arm64
+          echo "Published ${repo}:${tag} (+ :arm64)"

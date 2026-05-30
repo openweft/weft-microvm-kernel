@@ -1,0 +1,112 @@
+# Kernel build pipeline for weft microVMs (repo openweft/weft-microvm-kernel).
+#
+# Produces a raw aarch64 Linux Image with FUSE_FS + VIRTIO_FS +
+# WIREGUARD on top of cloud-boot's cloud-arm64 baseline. Installed
+# at $XDG_DATA_HOME/weft-microvm/kernel (default
+# ~/.local/share/weft-microvm/kernel) — the path weft-microvm picks
+# up automatically.
+#
+# Why a sibling pipeline rather than a fragment fed into
+# cloud-boot/kernel: weft-microvm owns its kernel
+# requirements (FUSE+VIRTIO_FS aren't part of cloud-boot's
+# distro-boot story). The Dockerfile here references
+# cloud-boot/kernel as a source of truth for the cloud-arm64
+# config and the CMDLINE_EXTEND patch — it just layers our
+# fragment on top before olddefconfig.
+
+version: '3'
+
+vars:
+  CLOUD_BOOT_KERNEL: '{{.TASKFILE_DIR}}/../../cloud-boot/kernel'
+  IMAGE_TAG:        'weft-microvm-kernel-arm64:7.0.8'
+  OUT_DIR:          '{{.XDG_DATA_HOME | default (printf "%s/.local/share" .HOME)}}/weft-microvm'
+  STAGED_CONTEXT:   '{{.TASKFILE_DIR}}/.build-ctx'
+
+tasks:
+
+  # ---------- arm64 microvm kernel --------------------------------------
+
+  arm64-microvm:
+    desc: Build the aarch64 Linux kernel with FUSE_FS + VIRTIO_FS + WIREGUARD and install at $XDG_DATA_HOME/weft-microvm/kernel.
+    deps: [stage-context]
+    cmds:
+      - mkdir -p "{{.OUT_DIR}}"
+      # Use `docker build --output` to extract /Image from the export
+      # stage straight to the host without ever instantiating a
+      # container. Requires BuildKit (default in modern Docker).
+      - >-
+        docker build
+        --platform linux/arm64
+        --target export
+        --output type=local,dest="{{.OUT_DIR}}"
+        -f "{{.STAGED_CONTEXT}}/Dockerfile.arm64-microvm"
+        "{{.STAGED_CONTEXT}}"
+      - mv "{{.OUT_DIR}}/Image" "{{.OUT_DIR}}/kernel"
+      - ls -lh "{{.OUT_DIR}}/kernel"
+
+  # Stage the build context: the Dockerfile + microvm fragment from
+  # this dir, plus cloud-arm64.config and the CMDLINE_EXTEND patch
+  # from cloud-boot/kernel. Keeps the cloud-arm64 baseline a single
+  # symlink-able source of truth rather than vendoring a copy.
+  stage-context:
+    cmds:
+      - rm -rf "{{.STAGED_CONTEXT}}"
+      - mkdir -p "{{.STAGED_CONTEXT}}/patches"
+      - cp "{{.TASKFILE_DIR}}/Dockerfile.arm64-microvm" "{{.STAGED_CONTEXT}}/"
+      - cp "{{.TASKFILE_DIR}}/microvm.config-fragment"  "{{.STAGED_CONTEXT}}/"
+      - cp "{{.CLOUD_BOOT_KERNEL}}/cloud-arm64.config"  "{{.STAGED_CONTEXT}}/"
+      - cp "{{.CLOUD_BOOT_KERNEL}}/patches/arm64-cmdline-extend.patch" "{{.STAGED_CONTEXT}}/patches/"
+
+  clean:
+    desc: Remove the staged build context and the installed kernel.
+    cmds:
+      - rm -rf "{{.STAGED_CONTEXT}}"
+      - rm -f  "{{.OUT_DIR}}/kernel"
+
+  # ---------- arm64 microvm kernel via QEMU/TCG (no Docker) ------------
+  # Same artefact as `arm64-microvm`, built inside a short-lived Debian
+  # arm64 builder VM under qemu-system-aarch64 -accel tcg. Use this when
+  # Docker can't run linux/arm64 builds — e.g. on a macOS Tart guest
+  # where nested virt isn't available so colima/qemu-driver-docker fail
+  # to launch a Linux engine. The base qcow2 is pulled once and cached.
+  #
+  # Pipeline lives at ~/.cache/weft-kbuild/ (qcow2, cloud-init seed,
+  # ssh keys, build inputs). Inputs mirrored from this dir so a fragment
+  # change here is picked up on the next `task arm64-microvm-qemu`.
+  # See [[qemu-microvm-9p]] for the architectural why.
+  arm64-microvm-qemu:
+    desc: "QEMU/TCG build (no Docker) of the arm64 microVM kernel; installs at $XDG_DATA_HOME/weft-microvm/kernel."
+    vars:
+      KBUILD_DIR: '{{.HOME}}/.cache/weft-kbuild'
+    cmds:
+      - mkdir -p "{{.KBUILD_DIR}}/share" "{{.OUT_DIR}}"
+      # Mirror the build inputs into the cache dir — gen-seed.sh
+      # base64-injects them into cloud-init's user-data, so any
+      # fragment edit here is automatically applied to the next build.
+      - cp "{{.TASKFILE_DIR}}/microvm.config-fragment"                                      "{{.KBUILD_DIR}}/share/microvm.config-fragment"
+      - cp "{{.CLOUD_BOOT_KERNEL}}/cloud-arm64.config"                                       "{{.KBUILD_DIR}}/share/cloud-arm64.config"
+      - cp "{{.CLOUD_BOOT_KERNEL}}/patches/arm64-cmdline-extend.patch"                       "{{.KBUILD_DIR}}/share/arm64-cmdline-extend.patch"
+      # Fresh instance-id (epoch seconds) forces cloud-init to re-run
+      # runcmd → build.sh on the next boot, even though the qcow2 is
+      # reused across runs.
+      - '{{.KBUILD_DIR}}/gen-seed.sh'
+      # Boot the builder; build.sh runs in the background. Poll the
+      # in-VM .config + STATUS sentinel to detect both "rebuild took
+      # the new fragment" AND "kernel finished" — guards against
+      # stale STATUS leftover from a previous run.
+      - nohup '{{.KBUILD_DIR}}/run-builder.sh' >'{{.KBUILD_DIR}}/builder.console' 2>&1 &
+      - |
+        SSH="ssh -i {{.KBUILD_DIR}}/id_kbuild -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -p 2222 debian@localhost"
+        START=$(date +%s)
+        until S=$($SSH "test -f /opt/kbuild/STATUS && cat /opt/kbuild/STATUS" 2>/dev/null) && [ "$S" = "OK" ]; do
+          EL=$(( $(date +%s) - START ))
+          [ $EL -gt 3600 ] && { echo "kernel build timed out after ${EL}s — last STATUS='$S'"; exit 1; }
+          sleep 30
+        done
+        echo "kernel built in $(( $(date +%s) - START ))s"
+      - scp -i '{{.KBUILD_DIR}}/id_kbuild' -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P 2222 debian@localhost:/opt/kbuild/Image "{{.OUT_DIR}}/kernel"
+      # Power off cleanly; ignore failures (sshd may already be tearing
+      # down). The kernel build VM has no other persistent state we
+      # need beyond what's already cached in the qcow2.
+      - ssh -i {{.KBUILD_DIR}}/id_kbuild -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p 2222 debian@localhost 'sudo systemctl poweroff' || true
+      - ls -lh "{{.OUT_DIR}}/kernel"
